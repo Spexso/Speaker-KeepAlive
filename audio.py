@@ -8,10 +8,15 @@ BLOCK_SIZE = 1024
 stream = None
 stream_lock = threading.Lock()
 is_playing = False
+_phase = 0.0
 
 
 def audio_callback(outdata, frames, time_info, status):
-    outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+    global _phase
+    # 20 Hz sine at ~-80 dB — inaudible but prevents driver silence detection
+    t = (_phase + np.arange(frames)) / SAMPLE_RATE
+    outdata[:, 0] = (np.sin(2 * np.pi * 20 * t) * 1e-4).astype(np.float32)
+    _phase = (_phase + frames) % SAMPLE_RATE
 
 
 def start_audio():

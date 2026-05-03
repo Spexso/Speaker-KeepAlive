@@ -1,4 +1,3 @@
-import threading
 import frontend
 
 def main():

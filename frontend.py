@@ -1,3 +1,7 @@
+import os
+import sys
+import tempfile
+import subprocess
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
@@ -43,6 +47,8 @@ def build_menu(icon):
              checked=lambda i: systemreg.is_startup_enabled()),
         pystray.Menu.SEPARATOR,
         item("Quit", lambda i, it: on_quit(icon)),
+        pystray.Menu.SEPARATOR,
+        item("Uninstall", lambda i, it: on_uninstall(icon)),
     )
 
 
@@ -62,6 +68,30 @@ def on_toggle_startup(icon):
 
 def on_quit(icon):
     audio.stop_audio()
+    icon.stop()
+
+
+def on_uninstall(icon):
+    systemreg.disable_startup()
+    audio.stop_audio()
+
+    if getattr(sys, 'frozen', False):
+        exe_path = sys.executable
+        bat = (
+            "@echo off\n"
+            "timeout /t 2 /nobreak >nul\n"
+            f'del /f "{exe_path}"\n'
+            "del /f \"%~f0\"\n"
+        )
+        fd, bat_path = tempfile.mkstemp(suffix=".bat")
+        with os.fdopen(fd, "w") as f:
+            f.write(bat)
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            close_fds=True,
+        )
+
     icon.stop()
 
 

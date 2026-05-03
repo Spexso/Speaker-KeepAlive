@@ -8,7 +8,7 @@ APP_NAME = "SpeakerKeepAlive"
 def get_exe_path():
     if getattr(sys, 'frozen', False):
         return sys.executable
-    return f'pythonw "{os.path.abspath(__file__)}"'
+    return f'pythonw "{os.path.join(os.path.dirname(os.path.abspath(__file__)), "keepalive.py")}"'
 
 
 def is_startup_enabled():
