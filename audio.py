@@ -1,46 +1,131 @@
+import ctypes
 import threading
+from ctypes import wintypes
+
 import numpy as np
 import sounddevice as sd
 
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
 
+# 30 Hz at -50 dBFS: well below hearing threshold at that frequency (and below what
+# small BT speakers can physically reproduce), but loud enough to survive 16-bit
+# mixing and SBC/AAC encoding, so the speaker doesn't see it as silence.
+TONE_HZ = 30
+TONE_AMPLITUDE = 10 ** (-50 / 20)
+
+# How often to check whether the default output device changed or the stream died
+WATCHDOG_INTERVAL = 3.0
+
 stream = None
 stream_lock = threading.Lock()
 is_playing = False
-_phase = 0.0
+_phase = 0
+_device_name = None
+_watchdog = None
+_watchdog_stop = threading.Event()
+
+_winmm = ctypes.WinDLL("winmm")
+_WAVE_MAPPER = 0xFFFFFFFF
+_DRVM_MAPPER_PREFERRED_GET = 0x2015
+
+
+class _WAVEOUTCAPSW(ctypes.Structure):
+    _fields_ = [
+        ("wMid", wintypes.WORD),
+        ("wPid", wintypes.WORD),
+        ("vDriverVersion", wintypes.UINT),
+        ("szPname", wintypes.WCHAR * 32),
+        ("dwFormats", wintypes.DWORD),
+        ("wChannels", wintypes.WORD),
+        ("wReserved1", wintypes.WORD),
+        ("dwSupport", wintypes.DWORD),
+    ]
+
+
+def get_default_output_name():
+    """Live query of the Windows default playback device (PortAudio caches its list)."""
+    dev = wintypes.DWORD()
+    flags = wintypes.DWORD()
+    if _winmm.waveOutMessage(ctypes.c_void_p(_WAVE_MAPPER), _DRVM_MAPPER_PREFERRED_GET,
+                             ctypes.byref(dev), ctypes.byref(flags)) != 0:
+        return None
+    caps = _WAVEOUTCAPSW()
+    if _winmm.waveOutGetDevCapsW(ctypes.c_size_t(dev.value), ctypes.byref(caps),
+                                 ctypes.sizeof(caps)) != 0:
+        return None
+    return caps.szPname
 
 
 def audio_callback(outdata, frames, time_info, status):
     global _phase
-    # 20 Hz sine at ~-80 dB — inaudible but prevents driver silence detection
     t = (_phase + np.arange(frames)) / SAMPLE_RATE
-    outdata[:, 0] = (np.sin(2 * np.pi * 20 * t) * 1e-4).astype(np.float32)
+    outdata[:, 0] = (np.sin(2 * np.pi * TONE_HZ * t) * TONE_AMPLITUDE).astype(np.float32)
     _phase = (_phase + frames) % SAMPLE_RATE
 
 
+def _open_stream():
+    global stream, _device_name
+    # Re-scan devices so we pick up the *current* default, not the one at launch
+    sd._terminate()
+    sd._initialize()
+    _device_name = get_default_output_name()
+    stream = sd.OutputStream(
+        samplerate=SAMPLE_RATE,
+        blocksize=BLOCK_SIZE,
+        channels=1,
+        dtype='float32',
+        callback=audio_callback
+    )
+    stream.start()
+
+
+def _close_stream():
+    global stream
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except sd.PortAudioError:
+        pass
+    stream = None
+
+
+def _watchdog_loop():
+    while not _watchdog_stop.wait(WATCHDOG_INTERVAL):
+        with stream_lock:
+            if not is_playing:
+                continue
+            healthy = stream is not None and stream.active
+            if healthy and get_default_output_name() == _device_name:
+                continue
+            _close_stream()
+            try:
+                _open_stream()
+            except sd.PortAudioError:
+                # No usable output right now; retry next tick
+                _close_stream()
+
+
 def start_audio():
-    global stream, is_playing
+    global is_playing, _watchdog
     with stream_lock:
-        if stream is not None:
+        if is_playing:
             return
-        stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            channels=1,
-            dtype='float32',
-            callback=audio_callback
-        )
-        stream.start()
         is_playing = True
+        try:
+            _open_stream()
+        except sd.PortAudioError:
+            _close_stream()  # watchdog will retry
+    if _watchdog is None:
+        _watchdog_stop.clear()
+        _watchdog = threading.Thread(target=_watchdog_loop, daemon=True)
+        _watchdog.start()
 
 
 def stop_audio():
-    global stream, is_playing
+    global is_playing
     with stream_lock:
-        if stream is None:
-            return
-        stream.stop()
-        stream.close()
-        stream = None
         is_playing = False
+        _close_stream()

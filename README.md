@@ -28,5 +28,7 @@ Double-click `build.bat` — it installs deps and compiles to `dist\SpeakerKeepA
 ## Notes
 
 - Uses ~0% CPU, no audible sound
-- Works on the currently selected default audio output device
-- If you switch audio devices, restart the app
+- Plays to the Windows default audio output device, and automatically follows it
+  when the default changes or the speaker disconnects/reconnects (checked every 3 s)
+- The keep-alive signal is a 30 Hz tone at -50 dBFS. If your speaker still shuts off,
+  raise `TONE_AMPLITUDE` in `audio.py`; if you can hear it, lower it
