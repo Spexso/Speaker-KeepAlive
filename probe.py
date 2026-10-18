@@ -9,8 +9,6 @@ import time
 import numpy as np
 import sounddevice as sd
 
-import audio
-
 freq = float(sys.argv[1]) if len(sys.argv) > 1 else 30
 db = float(sys.argv[2]) if len(sys.argv) > 2 else -50
 amp = 10 ** (db / 20)
@@ -25,7 +23,7 @@ def cb(outdata, frames, time_info, status):
     phase += frames
 
 
-print(f"Device: {audio.get_default_output_name()}")
+print(f"Device: {sd.query_devices(kind='output')['name']}")
 print(f"Tone:   {freq:g} Hz at {db:g} dBFS  (Ctrl+C to stop)")
 start = time.time()
 with sd.OutputStream(samplerate=rate, channels=1, dtype='float32', callback=cb):

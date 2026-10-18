@@ -1,6 +1,6 @@
 @echo off
 echo Installing dependencies...
-pip install sounddevice numpy pillow pystray pyinstaller
+pip install -r requirements.txt pyinstaller
 
 echo.
 echo Building executable...

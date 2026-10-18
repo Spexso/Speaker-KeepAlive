@@ -1,141 +1,204 @@
+import asyncio
 import ctypes
+import os
+import tempfile
 import threading
-from ctypes import wintypes
+import wave
 
-import numpy as np
-import sounddevice as sd
+from winrt.windows.devices.enumeration import DeviceInformation
+from winrt.windows.foundation import Uri
+from winrt.windows.media import MediaPlaybackType
+from winrt.windows.media.control import (
+    GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+)
+from winrt.windows.media.core import MediaSource
+from winrt.windows.media.devices import MediaDevice
+from winrt.windows.media.playback import (
+    MediaCommandEnablingRule,
+    MediaPlaybackItem,
+    MediaPlaybackState,
+    MediaPlayer,
+)
 
-SAMPLE_RATE = 44100
-BLOCK_SIZE = 1024
+# The speaker ignores audio level: its 15 min idle timer only stops while Windows reports
+# a *Playing* media session to it over Bluetooth (AVRCP). Tones at any level/frequency
+# were ignored, a playing media session held it on. So we loop a silent clip on the
+# speaker through a WinRT MediaPlayer, which Windows lists as a playing media session
+# ("Speaker Keep-Alive" in the volume flyout).
+#
+# To stay out of the way we pause while another app plays media (its own Playing status
+# keeps the speaker awake), and pass media keys that Windows routes to our session on to
+# the app that played last.
 
-# Sub-bass reads as silence to the speaker: it only reproduces 100 Hz-20 kHz and
-# filters below that before its idle detection (30 Hz @ -50 dBFS still let it
-# power off every 15 min). 19 kHz is inside its range and survives SBC, but is
-# above what adults can hear.
-TONE_HZ = 19000
-TONE_AMPLITUDE = 10 ** (-30 / 20)
+# Only this speaker is kept awake, whatever the Windows default output is. Matched as a
+# substring of the device name; change it to keep a different speaker alive.
+SPEAKER_NAME = "Sound Pocket"
+TITLE = "Speaker Keep-Alive"
 
-# How often to check whether the default output device changed or the stream died
-WATCHDOG_INTERVAL = 3.0
+# How often to check the speaker connection and other apps' playback
+POLL_INTERVAL = 2.0
 
-stream = None
-stream_lock = threading.Lock()
-is_playing = False
-_phase = 0
-_callbacks = 0  # bumped by the audio callback; a stalled count means a dead stream
-_device_name = None
-_watchdog = None
-_watchdog_stop = threading.Event()
+is_playing = False  # keep-alive enabled (tray Pause/Resume)
 
-_winmm = ctypes.WinDLL("winmm")
-_WAVE_MAPPER = 0xFFFFFFFF
-_DRVM_MAPPER_PREFERRED_GET = 0x2015
-
-
-class _WAVEOUTCAPSW(ctypes.Structure):
-    _fields_ = [
-        ("wMid", wintypes.WORD),
-        ("wPid", wintypes.WORD),
-        ("vDriverVersion", wintypes.UINT),
-        ("szPname", wintypes.WCHAR * 32),
-        ("dwFormats", wintypes.DWORD),
-        ("wChannels", wintypes.WORD),
-        ("wReserved1", wintypes.WORD),
-        ("dwSupport", wintypes.DWORD),
-    ]
-
-
-def get_default_output_name():
-    """Live query of the Windows default playback device (PortAudio caches its list)."""
-    dev = wintypes.DWORD()
-    flags = wintypes.DWORD()
-    if _winmm.waveOutMessage(ctypes.c_void_p(_WAVE_MAPPER), _DRVM_MAPPER_PREFERRED_GET,
-                             ctypes.byref(dev), ctypes.byref(flags)) != 0:
-        return None
-    caps = _WAVEOUTCAPSW()
-    if _winmm.waveOutGetDevCapsW(ctypes.c_size_t(dev.value), ctypes.byref(caps),
-                                 ctypes.sizeof(caps)) != 0:
-        return None
-    return caps.szPname
+_loop = None
+_wake = None
+_thread = None
+_manager = None
+_player = None
+_stalled = 0
+_last_other = None  # session id of the app that last played media, for forwarding keys
 
 
-def audio_callback(outdata, frames, time_info, status):
-    global _phase, _callbacks
-    t = (_phase + np.arange(frames)) / SAMPLE_RATE
-    outdata[:, 0] = (np.sin(2 * np.pi * TONE_HZ * t) * TONE_AMPLITUDE).astype(np.float32)
-    _phase = (_phase + frames) % SAMPLE_RATE
-    _callbacks += 1
+def _own_session_id():
+    # Windows identifies a desktop app's media session by its process image name
+    buf = ctypes.create_unicode_buffer(1024)
+    ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+    return os.path.basename(buf.value)
 
 
-def _open_stream():
-    global stream, _device_name
-    # Re-scan devices so we pick up the *current* default, not the one at launch
-    try:
-        sd._terminate()
-    except sd.PortAudioError:
-        pass  # already uninitialized because a previous re-init failed
-    sd._initialize()
-    _device_name = get_default_output_name()
-    stream = sd.OutputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=BLOCK_SIZE,
-        channels=1,
-        dtype='float32',
-        callback=audio_callback
-    )
-    stream.start()
+_OWN_ID = _own_session_id()
 
 
-def _close_stream():
-    global stream
-    if stream is None:
+def _is_speaker(name):
+    return SPEAKER_NAME.lower() in name.lower()
+
+
+def _silence_file():
+    path = os.path.join(tempfile.gettempdir(), "SpeakerKeepAlive-silence.wav")
+    if not os.path.exists(path):
+        with wave.open(path, "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(44100)
+            f.writeframes(bytes(2 * 44100 * 5))
+    return path
+
+
+async def _find_speaker():
+    devices = await DeviceInformation.find_all_async_aqs_filter(
+        MediaDevice.get_audio_render_selector())
+    return next((d for d in devices if _is_speaker(d.name)), None)
+
+
+def _forwarder(action):
+    def handler(sender, args):
+        args.handled = True  # keep the keep-alive playing
+        _loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_forward(action)))
+    return handler
+
+
+async def _forward(action):
+    others = [s for s in _manager.get_sessions() if s.source_app_user_model_id != _OWN_ID]
+    target = next((s for s in others if s.source_app_user_model_id == _last_other),
+                  others[0] if others else None)
+    if target is None:
+        return
+    if action == "next":
+        await target.try_skip_next_async()
+    elif action == "previous":
+        await target.try_skip_previous_async()
+    else:
+        await target.try_toggle_play_pause_async()
+    _wake.set()  # yield right away if that started their playback
+
+
+def _open_player(device):
+    player = MediaPlayer()
+    player.audio_device = device
+    player.is_looping_enabled = True
+    item = MediaPlaybackItem(MediaSource.create_from_uri(Uri(_silence_file())))
+    props = item.get_display_properties()
+    props.type = MediaPlaybackType.MUSIC
+    props.music_properties.title = TITLE
+    props.music_properties.artist = "Keeping your speaker awake"
+    item.apply_display_properties(props)
+    player.source = item
+    commands = player.command_manager
+    commands.next_behavior.enabling_rule = MediaCommandEnablingRule.ALWAYS
+    commands.previous_behavior.enabling_rule = MediaCommandEnablingRule.ALWAYS
+    commands.add_play_received(_forwarder("play_pause"))
+    commands.add_pause_received(_forwarder("play_pause"))
+    commands.add_next_received(_forwarder("next"))
+    commands.add_previous_received(_forwarder("previous"))
+    player.play()
+    return player
+
+
+def _close_player():
+    global _player
+    if _player is None:
         return
     try:
-        stream.stop()
-        stream.close()
-    except sd.PortAudioError:
+        _player.pause()
+        _player.close()
+    except OSError:
         pass
-    stream = None
+    _player = None
 
 
-def _watchdog_loop():
-    last_callbacks = -1
-    while not _watchdog_stop.wait(WATCHDOG_INTERVAL):
-        with stream_lock:
-            if not is_playing:
-                continue
-            try:
-                # A stream can report active yet stop calling back (e.g. after sleep)
-                healthy = (stream is not None and stream.active
-                           and _callbacks != last_callbacks)
-                last_callbacks = _callbacks
-                if healthy and get_default_output_name() == _device_name:
-                    continue
-                _close_stream()
-                _open_stream()
-            except Exception:
-                # No usable output right now; retry next tick. Never let this thread die.
-                _close_stream()
+async def _tick():
+    global _player, _stalled, _last_other
+    device = await _find_speaker() if is_playing else None
+    if device is None:
+        _close_player()
+        return
+    if _player is None:
+        _player = _open_player(device)
+        _stalled = 0
+        return
+    playing = [s for s in _manager.get_sessions()
+               if s.source_app_user_model_id != _OWN_ID
+               and s.get_playback_info().playback_status == PlaybackStatus.PLAYING]
+    state = _player.playback_session.playback_state
+    if playing:
+        _last_other = playing[0].source_app_user_model_id
+        if state == MediaPlaybackState.PLAYING:
+            _player.pause()
+    elif state == MediaPlaybackState.PLAYING:
+        _stalled = 0
+    else:
+        # Won't resume, e.g. the speaker reconnected between two polls and the player
+        # lost its device: start over with a fresh one
+        _stalled += 1
+        if _stalled > 2:
+            _close_player()
+        else:
+            _player.play()
+
+
+async def _main():
+    global _loop, _wake, _manager
+    _loop = asyncio.get_running_loop()
+    _wake = asyncio.Event()
+    _manager = await SessionManager.request_async()
+    while True:
+        try:
+            await _tick()
+        except Exception:
+            _close_player()  # retry from scratch next tick; never let this thread die
+        try:
+            await asyncio.wait_for(_wake.wait(), POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        _wake.clear()
+
+
+def _poke():
+    if _loop is not None:
+        _loop.call_soon_threadsafe(_wake.set)
 
 
 def start_audio():
-    global is_playing, _watchdog
-    with stream_lock:
-        if is_playing:
-            return
-        is_playing = True
-        try:
-            _open_stream()
-        except sd.PortAudioError:
-            _close_stream()  # watchdog will retry
-    if _watchdog is None:
-        _watchdog_stop.clear()
-        _watchdog = threading.Thread(target=_watchdog_loop, daemon=True)
-        _watchdog.start()
+    global is_playing, _thread
+    is_playing = True
+    if _thread is None:
+        _thread = threading.Thread(target=asyncio.run, args=(_main(),), daemon=True)
+        _thread.start()
+    _poke()
 
 
 def stop_audio():
     global is_playing
-    with stream_lock:
-        is_playing = False
-        _close_stream()
+    is_playing = False
+    _poke()
