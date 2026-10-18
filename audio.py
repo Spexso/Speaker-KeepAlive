@@ -8,11 +8,12 @@ import sounddevice as sd
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
 
-# 30 Hz at -50 dBFS: well below hearing threshold at that frequency (and below what
-# small BT speakers can physically reproduce), but loud enough to survive 16-bit
-# mixing and SBC/AAC encoding, so the speaker doesn't see it as silence.
-TONE_HZ = 30
-TONE_AMPLITUDE = 10 ** (-50 / 20)
+# Sub-bass reads as silence to the speaker: it only reproduces 100 Hz-20 kHz and
+# filters below that before its idle detection (30 Hz @ -50 dBFS still let it
+# power off every 15 min). 19 kHz is inside its range and survives SBC, but is
+# above what adults can hear.
+TONE_HZ = 19000
+TONE_AMPLITUDE = 10 ** (-30 / 20)
 
 # How often to check whether the default output device changed or the stream died
 WATCHDOG_INTERVAL = 3.0
@@ -21,6 +22,7 @@ stream = None
 stream_lock = threading.Lock()
 is_playing = False
 _phase = 0
+_callbacks = 0  # bumped by the audio callback; a stalled count means a dead stream
 _device_name = None
 _watchdog = None
 _watchdog_stop = threading.Event()
@@ -58,16 +60,20 @@ def get_default_output_name():
 
 
 def audio_callback(outdata, frames, time_info, status):
-    global _phase
+    global _phase, _callbacks
     t = (_phase + np.arange(frames)) / SAMPLE_RATE
     outdata[:, 0] = (np.sin(2 * np.pi * TONE_HZ * t) * TONE_AMPLITUDE).astype(np.float32)
     _phase = (_phase + frames) % SAMPLE_RATE
+    _callbacks += 1
 
 
 def _open_stream():
     global stream, _device_name
     # Re-scan devices so we pick up the *current* default, not the one at launch
-    sd._terminate()
+    try:
+        sd._terminate()
+    except sd.PortAudioError:
+        pass  # already uninitialized because a previous re-init failed
     sd._initialize()
     _device_name = get_default_output_name()
     stream = sd.OutputStream(
@@ -93,18 +99,22 @@ def _close_stream():
 
 
 def _watchdog_loop():
+    last_callbacks = -1
     while not _watchdog_stop.wait(WATCHDOG_INTERVAL):
         with stream_lock:
             if not is_playing:
                 continue
-            healthy = stream is not None and stream.active
-            if healthy and get_default_output_name() == _device_name:
-                continue
-            _close_stream()
             try:
+                # A stream can report active yet stop calling back (e.g. after sleep)
+                healthy = (stream is not None and stream.active
+                           and _callbacks != last_callbacks)
+                last_callbacks = _callbacks
+                if healthy and get_default_output_name() == _device_name:
+                    continue
+                _close_stream()
                 _open_stream()
-            except sd.PortAudioError:
-                # No usable output right now; retry next tick
+            except Exception:
+                # No usable output right now; retry next tick. Never let this thread die.
                 _close_stream()
 
 
